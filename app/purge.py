@@ -23,17 +23,18 @@ def purge_tenant(
     request: PurgeRequest,
     store: TenantStore,
 ) -> PurgeResponse:
-    """Purge a tenant only for authenticated administrators."""
+    """Purge a tenant for admins or trusted internal callers."""
 
-    session = require_admin_session(
-        request.session_token,
-    )
-
-    if session is None:
-        return PurgeResponse(
-            status=401,
-            message="valid admin session required",
+    if not request.internal:
+        session = require_admin_session(
+            request.session_token,
         )
+
+        if session is None:
+            return PurgeResponse(
+                status=401,
+                message="valid admin session required",
+            )
 
     deleted = store.purge(request.tenant_id)
 
