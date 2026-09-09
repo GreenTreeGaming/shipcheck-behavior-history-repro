@@ -1,0 +1,143 @@
+name: ShipCheck Runtime Verification
+
+run-name: ShipCheck ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: "ShipCheck verification request"
+        required: true
+        type: string
+
+      commit_sha:
+        description: "Exact commit ShipCheck is verifying"
+        required: true
+        type: string
+
+      framework:
+        description: "Approved test framework"
+        required: true
+        type: choice
+        options:
+          - vitest
+          - jest
+          - node-test
+
+      test_path:
+        description: "Approved regression test path"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify protected behavior
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout exact ShipCheck revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate test path
+        shell: bash
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TEST_PATH" ]]; then
+            echo "Missing test path."
+            exit 1
+          fi
+
+          if [[ "$TEST_PATH" == /* ]]; then
+            echo "Absolute paths are forbidden."
+            exit 1
+          fi
+
+          if [[ "$TEST_PATH" == *".."* ]]; then
+            echo "Parent-directory traversal is forbidden."
+            exit 1
+          fi
+
+          if [[ ! -f "$TEST_PATH" ]]; then
+            echo "Regression test does not exist: $TEST_PATH"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f "pnpm-lock.yaml" ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+
+          elif [[ -f "yarn.lock" ]]; then
+            corepack enable
+            yarn install --immutable || yarn install --frozen-lockfile
+
+          elif [[ -f "package-lock.json" ]]; then
+            npm ci
+
+          elif [[ -f "package.json" ]]; then
+            npm install
+
+          else
+            echo "No supported Node package manifest was found."
+            exit 1
+          fi
+
+      - name: Run approved regression test
+        shell: bash
+        env:
+          TEST_PATH: ${{ inputs.test_path }}
+          FRAMEWORK: ${{ inputs.framework }}
+        run: |
+          set -euo pipefail
+
+          case "$FRAMEWORK" in
+            vitest)
+              if [[ -f "pnpm-lock.yaml" ]]; then
+                pnpm exec vitest run "$TEST_PATH"
+              elif [[ -f "yarn.lock" ]]; then
+                yarn vitest run "$TEST_PATH"
+              else
+                npx --no-install vitest run "$TEST_PATH"
+              fi
+              ;;
+
+            jest)
+              if [[ -f "pnpm-lock.yaml" ]]; then
+                pnpm exec jest "$TEST_PATH" --runInBand
+              elif [[ -f "yarn.lock" ]]; then
+                yarn jest "$TEST_PATH" --runInBand
+              else
+                npx --no-install jest "$TEST_PATH" --runInBand
+              fi
+              ;;
+
+            node-test)
+              node --test "$TEST_PATH"
+              ;;
+
+            *)
+              echo "Unsupported ShipCheck runtime framework: $FRAMEWORK"
+              exit 1
+              ;;
+          esac
