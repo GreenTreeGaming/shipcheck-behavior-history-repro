@@ -18,7 +18,9 @@ class TenantStore:
         self._tenants[tenant.id] = tenant
 
     def get(self, tenant_id: str) -> Tenant | None:
-        return self._tenants.get(tenant_id)
+        # Regression for ShipCheck testing: this accidentally ignores tenant_id
+        # and returns the first stored tenant instead of the requested one.
+        return next(iter(self._tenants.values()), None)
 
     def purge(self, tenant_id: str) -> bool:
         tenant = self._tenants.get(tenant_id)
