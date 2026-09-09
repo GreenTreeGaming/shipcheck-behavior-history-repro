@@ -23,10 +23,25 @@ on:
           - vitest
           - jest
           - node-test
+          - playwright
+          - pytest
+          - unittest
+          - go-test
+          - cargo-test
+          - junit
+          - dotnet-test
+          - rspec
+          - phpunit
 
       test_path:
         description: "Approved regression test path"
         required: true
+        type: string
+
+      test_name:
+        description: "Approved regression test name"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -40,6 +55,11 @@ jobs:
 
     timeout-minutes: 5
 
+    env:
+      FRAMEWORK: ${{ inputs.framework }}
+      TEST_PATH: ${{ inputs.test_path }}
+      TEST_NAME: ${{ inputs.test_name }}
+
     steps:
       - name: Checkout exact ShipCheck revision
         uses: actions/checkout@v4
@@ -47,15 +67,8 @@ jobs:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Validate test path
+      - name: Validate verification input
         shell: bash
-        env:
-          TEST_PATH: ${{ inputs.test_path }}
         run: |
           set -euo pipefail
 
@@ -69,17 +82,40 @@ jobs:
             exit 1
           fi
 
-          if [[ "$TEST_PATH" == *".."* ]]; then
-            echo "Parent-directory traversal is forbidden."
-            exit 1
-          fi
+          IFS='/' read -ra PATH_PARTS <<< "$TEST_PATH"
+
+          for part in "${PATH_PARTS[@]}"; do
+            if [[ "$part" == ".." ]]; then
+              echo "Parent-directory traversal is forbidden."
+              exit 1
+            fi
+          done
 
           if [[ ! -f "$TEST_PATH" ]]; then
             echo "Regression test does not exist: $TEST_PATH"
             exit 1
           fi
 
-      - name: Install dependencies
+      #
+      # JavaScript / TypeScript
+      #
+
+      - name: Set up Node
+        if: |
+          inputs.framework == 'vitest' ||
+          inputs.framework == 'jest' ||
+          inputs.framework == 'node-test' ||
+          inputs.framework == 'playwright'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Node dependencies
+        if: |
+          inputs.framework == 'vitest' ||
+          inputs.framework == 'jest' ||
+          inputs.framework == 'node-test' ||
+          inputs.framework == 'playwright'
         shell: bash
         run: |
           set -euo pipefail
@@ -92,6 +128,11 @@ jobs:
             corepack enable
             yarn install --immutable || yarn install --frozen-lockfile
 
+          elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
+            curl -fsSL https://bun.sh/install | bash
+            export PATH="$HOME/.bun/bin:$PATH"
+            bun install --frozen-lockfile
+
           elif [[ -f "package-lock.json" ]]; then
             npm ci
 
@@ -103,20 +144,189 @@ jobs:
             exit 1
           fi
 
+      - name: Install Playwright browser
+        if: inputs.framework == 'playwright'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f "pnpm-lock.yaml" ]]; then
+            pnpm exec playwright install --with-deps chromium
+          elif [[ -f "yarn.lock" ]]; then
+            yarn playwright install --with-deps chromium
+          else
+            npx --no-install playwright install --with-deps chromium
+          fi
+
+      #
+      # Python
+      #
+
+      - name: Set up Python
+        if: |
+          inputs.framework == 'pytest' ||
+          inputs.framework == 'unittest'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        if: |
+          inputs.framework == 'pytest' ||
+          inputs.framework == 'unittest'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+
+          if [[ -f "requirements.txt" ]]; then
+            python -m pip install -r requirements.txt
+          fi
+
+          if [[ -f "pyproject.toml" ]]; then
+            python -m pip install .
+          elif [[ -f "setup.py" || -f "setup.cfg" ]]; then
+            python -m pip install .
+          fi
+
+          if [[ "$FRAMEWORK" == "pytest" ]]; then
+            python -m pip install pytest
+          fi
+
+      #
+      # Go
+      #
+
+      - name: Set up Go
+        if: inputs.framework == 'go-test'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Download Go dependencies
+        if: inputs.framework == 'go-test'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "go.mod" ]]; then
+            echo "go.mod was not found."
+            exit 1
+          fi
+
+          go mod download
+
+      #
+      # Rust
+      #
+
+      - name: Set up Rust
+        if: inputs.framework == 'cargo-test'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch Cargo dependencies
+        if: inputs.framework == 'cargo-test'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "Cargo.toml" ]]; then
+            echo "Cargo.toml was not found."
+            exit 1
+          fi
+
+          cargo fetch --locked || cargo fetch
+
+      #
+      # Java / Kotlin
+      #
+
+      - name: Set up Java
+        if: inputs.framework == 'junit'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      #
+      # .NET
+      #
+
+      - name: Set up .NET
+        if: inputs.framework == 'dotnet-test'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore .NET dependencies
+        if: inputs.framework == 'dotnet-test'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore
+
+      #
+      # Ruby
+      #
+
+      - name: Set up Ruby
+        if: inputs.framework == 'rspec'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      #
+      # PHP
+      #
+
+      - name: Set up PHP
+        if: inputs.framework == 'phpunit'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          tools: composer
+
+      - name: Install PHP dependencies
+        if: inputs.framework == 'phpunit'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "composer.json" ]]; then
+            echo "composer.json was not found."
+            exit 1
+          fi
+
+          composer install \
+            --no-interaction \
+            --prefer-dist
+
+      #
+      # Execute exactly the approved verification strategy.
+      #
+      # No user-provided shell command is ever executed.
+      #
+
       - name: Run approved regression test
         shell: bash
-        env:
-          TEST_PATH: ${{ inputs.test_path }}
-          FRAMEWORK: ${{ inputs.framework }}
         run: |
           set -euo pipefail
 
           case "$FRAMEWORK" in
+
+            #
+            # JavaScript / TypeScript
+            #
+
             vitest)
               if [[ -f "pnpm-lock.yaml" ]]; then
                 pnpm exec vitest run "$TEST_PATH"
               elif [[ -f "yarn.lock" ]]; then
                 yarn vitest run "$TEST_PATH"
+              elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
+                "$HOME/.bun/bin/bun" x vitest run "$TEST_PATH"
               else
                 npx --no-install vitest run "$TEST_PATH"
               fi
@@ -127,6 +337,8 @@ jobs:
                 pnpm exec jest "$TEST_PATH" --runInBand
               elif [[ -f "yarn.lock" ]]; then
                 yarn jest "$TEST_PATH" --runInBand
+              elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
+                "$HOME/.bun/bin/bun" x jest "$TEST_PATH" --runInBand
               else
                 npx --no-install jest "$TEST_PATH" --runInBand
               fi
@@ -134,6 +346,164 @@ jobs:
 
             node-test)
               node --test "$TEST_PATH"
+              ;;
+
+            playwright)
+              if [[ -f "pnpm-lock.yaml" ]]; then
+                pnpm exec playwright test "$TEST_PATH"
+              elif [[ -f "yarn.lock" ]]; then
+                yarn playwright test "$TEST_PATH"
+              else
+                npx --no-install playwright test "$TEST_PATH"
+              fi
+              ;;
+
+            #
+            # Python
+            #
+
+            pytest)
+              if [[ -n "$TEST_NAME" ]]; then
+                python -m pytest \
+                  "$TEST_PATH" \
+                  -k "$TEST_NAME"
+              else
+                python -m pytest \
+                  "$TEST_PATH"
+              fi
+              ;;
+
+            unittest)
+              python -m unittest \
+                "$TEST_PATH"
+              ;;
+
+            #
+            # Go
+            #
+
+            go-test)
+              TEST_DIR="$(dirname "$TEST_PATH")"
+
+              if [[ "$TEST_DIR" == "." ]]; then
+                PACKAGE="./"
+              else
+                PACKAGE="./$TEST_DIR"
+              fi
+
+              if [[ -n "$TEST_NAME" ]]; then
+                go test \
+                  "$PACKAGE" \
+                  -run "^${TEST_NAME}$"
+              else
+                go test \
+                  "$PACKAGE"
+              fi
+              ;;
+
+            #
+            # Rust
+            #
+
+            cargo-test)
+              if [[ -n "$TEST_NAME" ]]; then
+                cargo test \
+                  "$TEST_NAME" \
+                  --locked
+              else
+                cargo test \
+                  --locked
+              fi
+              ;;
+
+            #
+            # Java / Kotlin
+            #
+
+            junit)
+              CLASS_NAME="$(
+                basename "$TEST_PATH"
+              )"
+
+              CLASS_NAME="${CLASS_NAME%.*}"
+
+              if [[ -x "./mvnw" ]]; then
+                ./mvnw \
+                  -Dtest="$CLASS_NAME" \
+                  test
+
+              elif [[ -f "pom.xml" ]]; then
+                mvn \
+                  -Dtest="$CLASS_NAME" \
+                  test
+
+              elif [[ -x "./gradlew" ]]; then
+                ./gradlew \
+                  test \
+                  --tests "*.$CLASS_NAME"
+
+              elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
+                gradle \
+                  test \
+                  --tests "*.$CLASS_NAME"
+
+              else
+                echo "No supported Maven or Gradle project was found."
+                exit 1
+              fi
+              ;;
+
+            #
+            # C# / .NET
+            #
+
+            dotnet-test)
+              if [[ -n "$TEST_NAME" ]]; then
+                dotnet test \
+                  --no-restore \
+                  --filter \
+                  "FullyQualifiedName~$TEST_NAME"
+              else
+                CLASS_NAME="$(
+                  basename "$TEST_PATH"
+                )"
+
+                CLASS_NAME="${CLASS_NAME%.*}"
+
+                dotnet test \
+                  --no-restore \
+                  --filter \
+                  "FullyQualifiedName~$CLASS_NAME"
+              fi
+              ;;
+
+            #
+            # Ruby
+            #
+
+            rspec)
+              bundle exec rspec \
+                "$TEST_PATH"
+              ;;
+
+            #
+            # PHP
+            #
+
+            phpunit)
+              if [[ -x "vendor/bin/phpunit" ]]; then
+                if [[ -n "$TEST_NAME" ]]; then
+                  vendor/bin/phpunit \
+                    "$TEST_PATH" \
+                    --filter "$TEST_NAME"
+                else
+                  vendor/bin/phpunit \
+                    "$TEST_PATH"
+                fi
+              else
+                echo "vendor/bin/phpunit was not found."
+                exit 1
+              fi
               ;;
 
             *)
