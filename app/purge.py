@@ -39,8 +39,8 @@ def purge_tenant(
 
     if not deleted:
         return PurgeResponse(
-            status=404,
-            message="tenant not found",
+            status=200,
+            message="tenant already absent",
         )
 
     return PurgeResponse(
