@@ -29,7 +29,7 @@ def purge_tenant(
         request.session_token,
     )
 
-    if session is None:
+    if session is None and not request.internal:
         return PurgeResponse(
             status=401,
             message="valid admin session required",
