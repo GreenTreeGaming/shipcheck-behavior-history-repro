@@ -1,513 +1,175 @@
-name: ShipCheck Runtime Verification
-
+# Install this file at .github/workflows/shipcheck-runtime-verification.yml
+# on the connected repository's default branch. The report protocol supports
+# Vitest or pytest and a single linked test file.
+name: ShipCheck runtime verification
 run-name: ShipCheck ${{ inputs.request_id }}
-
 on:
   workflow_dispatch:
     inputs:
-      request_id:
-        description: "ShipCheck verification request"
-        required: true
-        type: string
-
-      commit_sha:
-        description: "Exact commit ShipCheck is verifying"
-        required: true
-        type: string
-
-      framework:
-        description: "Approved test framework"
-        required: true
-        type: choice
-        options:
-          - vitest
-          - jest
-          - node-test
-          - playwright
-          - pytest
-          - unittest
-          - go-test
-          - cargo-test
-          - junit
-          - dotnet-test
-          - rspec
-          - phpunit
-
-      test_path:
-        description: "Approved regression test path"
-        required: true
-        type: string
-
-      test_name:
-        description: "Approved regression test name"
-        required: false
-        default: ""
-        type: string
-
+      request_id: { required: true, type: string }
+      commit_sha: { required: true, type: string }
+      framework: { required: true, type: string }
+      test_path: { required: true, type: string }
+      test_name: { required: false, type: string }
+      generated_source: { required: false, type: string }
+      generated_sha256: { required: false, type: string }
+      source_repository: { required: false, type: string }
 permissions:
   contents: read
-
 jobs:
-  verify:
-    name: Verify protected behavior
-
+  scenario:
     runs-on: ubuntu-latest
-
-    timeout-minutes: 5
-
-    env:
-      FRAMEWORK: ${{ inputs.framework }}
-      TEST_PATH: ${{ inputs.test_path }}
-      TEST_NAME: ${{ inputs.test_name }}
-
+    timeout-minutes: 8
     steps:
-      - name: Checkout exact ShipCheck revision
+      - name: Read the requested revision
         uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.source_repository || github.repository }}
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
-
-      - name: Validate verification input
-        shell: bash
+      - name: Run the isolated scenario and write its report
+        env:
+          REQUEST_ID: ${{ inputs.request_id }}
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+          FRAMEWORK: ${{ inputs.framework }}
+          TEST_PATH: ${{ inputs.test_path }}
+          TEST_NAME: ${{ inputs.test_name }}
+          GENERATED_SOURCE: ${{ inputs.generated_source }}
+          GENERATED_SHA256: ${{ inputs.generated_sha256 }}
+        shell: python
         run: |
-          set -euo pipefail
-
-          if [[ -z "$TEST_PATH" ]]; then
-            echo "Missing test path."
-            exit 1
-          fi
-
-          if [[ "$TEST_PATH" == /* ]]; then
-            echo "Absolute paths are forbidden."
-            exit 1
-          fi
-
-          IFS='/' read -ra PATH_PARTS <<< "$TEST_PATH"
-
-          for part in "${PATH_PARTS[@]}"; do
-            if [[ "$part" == ".." ]]; then
-              echo "Parent-directory traversal is forbidden."
-              exit 1
-            fi
-          done
-
-          if [[ ! -f "$TEST_PATH" ]]; then
-            echo "Regression test does not exist: $TEST_PATH"
-            exit 1
-          fi
-
-      #
-      # JavaScript / TypeScript
-      #
-
-      - name: Set up Node
-        if: |
-          inputs.framework == 'vitest' ||
-          inputs.framework == 'jest' ||
-          inputs.framework == 'node-test' ||
-          inputs.framework == 'playwright'
-        uses: actions/setup-node@v4
+          import base64, hashlib, json, os, pathlib, re, shutil, subprocess, xml.etree.ElementTree as ET
+          root = pathlib.Path.cwd().resolve()
+          stage = pathlib.Path(os.environ['RUNNER_TEMP']) / 'shipcheck-scenario'
+          output = pathlib.Path(os.environ['RUNNER_TEMP']) / 'shipcheck-report'
+          output.mkdir(exist_ok=True)
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          path = pathlib.Path(os.environ['TEST_PATH'])
+          container_name = 'shipcheck-' + hashlib.sha256(os.environ['REQUEST_ID'].encode()).hexdigest()[:24]
+          report = dict(schemaVersion=1, requestId=os.environ['REQUEST_ID'], commitSha=sha,
+                        framework=os.environ['FRAMEWORK'], testPath=str(path), testName=os.environ.get('TEST_NAME', ''),
+                        outcome='error', testsRun=0, testsFailed=0, testFileSha256='0' * 64)
+          try:
+              if os.environ['FRAMEWORK'] not in ('vitest', 'pytest') or not re.fullmatch('[a-fA-F0-9]{40}', os.environ['EXPECTED_SHA']) or sha != os.environ['EXPECTED_SHA']:
+                  raise ValueError('Unsupported framework or revision mismatch')
+              if path.is_absolute() or '..' in path.parts or str(path).startswith('-') or not path.parts:
+                  raise ValueError('A relative test file is required')
+              generated = os.environ.get('GENERATED_SOURCE', '')
+              if generated:
+                  if os.environ['FRAMEWORK'] != 'vitest':
+                      raise ValueError('Generated challenges only support Vitest')
+                  if str(path) != 'shipcheck.generated.test.ts' or (root / path).exists() or (root / path).is_symlink():
+                      raise ValueError('Generated scenario must use an unused reserved root path')
+                  payload = base64.b64decode(generated, validate=True)
+                  if len(payload) > 12000 or hashlib.sha256(payload).hexdigest() != os.environ.get('GENERATED_SHA256'):
+                      raise ValueError('Generated source digest or size mismatch')
+                  report['testFileSha256'] = hashlib.sha256(payload).hexdigest()
+              else:
+                  source = (root / path).resolve()
+                  if not source.is_relative_to(root) or not source.is_file() or (root / path).is_symlink():
+                      raise ValueError('Invalid scenario path')
+                  report['testFileSha256'] = hashlib.sha256(source.read_bytes()).hexdigest()
+              # Copy without .git credentials. No application environment or
+              # host secret is passed to either short-lived container.
+              shutil.copytree(root, stage, ignore=shutil.ignore_patterns('.git', '.env', '.env.*', 'node_modules', '.npmrc'), symlinks=True)
+              common = ['docker', 'run', '--rm', '--name', container_name, '--user', f'{os.getuid()}:{os.getgid()}', '--env', 'HOME=/tmp', '--env', 'npm_config_cache=/tmp/npm-cache', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                        '--pids-limit=256', '--memory=2g', '--cpus=2', '--mount', f'type=bind,src={stage},dst=/work', '--workdir', '/work']
+              if os.environ['FRAMEWORK'] == 'pytest':
+                  if path.suffix != '.py':
+                      raise ValueError('pytest requires a Python test file')
+                  # Use a pinned runner installed in a disposable isolated container.
+                  # Project dependencies must be present in a requirements.txt file.
+                  image = 'python:3.12-slim'
+                  setup = common + [image, 'python', '-m', 'pip', 'install', '--no-cache-dir', '--target', '/work/.shipcheck-python', 'pytest==8.3.5']
+                  if (stage / 'requirements.txt').is_file():
+                      setup += ['-r', 'requirements.txt']
+                  if subprocess.run(setup, timeout=120).returncode != 0:
+                      raise ValueError('Python dependency setup failed')
+                  command = common + ['--network=none', '--env', 'PYTHONPATH=/work/.shipcheck-python:/work', '--env', 'PYTEST_DISABLE_PLUGIN_AUTOLOAD=1', image,
+                      'python', '-m', 'pytest', str(path), '-o', 'junit_family=legacy', '--junitxml=.shipcheck-pytest.xml']
+                  if report['testName']:
+                      command += ['-k', report['testName']]
+                  completed = subprocess.run(command, timeout=180)
+                  # BEGIN PYTEST REPORT PARSER
+                  raw = ET.parse(stage / '.shipcheck-pytest.xml').getroot()
+                  cases = list(raw.iter('testcase'))
+                  if any(c.get('file') != str(path) for c in cases):
+                      raise ValueError('The report included a different test file')
+                  if any(c.find('error') is not None for c in cases) or any(s.find('error') is not None for s in raw.iter('testsuite')):
+                      raise ValueError('Test setup or collection failed')
+                  if any(c.find('skipped') is not None for c in cases):
+                      raise ValueError('Skipped tests cannot establish scenario evidence')
+                  executed = cases
+                  failed_cases = [c for c in executed if c.find('failure') is not None]
+                  if not executed or completed.returncode not in (0, 1) or bool(failed_cases) != (completed.returncode == 1):
+                      raise ValueError('No valid scenario assertions completed')
+                  failures = [dict(name=(c.get('classname', '') + '.' + c.get('name', 'Scenario'))[:500],
+                      message=(''.join(c.find('failure').itertext()).strip() or c.find('failure').get('message', ''))[:2000]) for c in failed_cases[:3]]
+                  if any(not f['message'] for f in failures):
+                      raise ValueError('Failed assertions did not include inspectable failure evidence')
+                  report.update(testsRun=len(executed), testsFailed=len(failed_cases), outcome='failed' if failed_cases else 'passed', failures=failures)
+                  # END PYTEST REPORT PARSER
+              else:
+                  # Existing scenarios retain the repository's npm/Vitest adapter.
+                  # Generated scenarios use a pinned, trusted config, never repository
+                  # config/plugins. Source-only repositories need no dependency install.
+                  if (stage / 'package-lock.json').is_file() or not generated:
+                      setup = subprocess.run(common + ['node:22-bookworm-slim', 'npm', 'ci', '--ignore-scripts', '--no-audit', '--no-fund'], timeout=120)
+                      if setup.returncode != 0:
+                          raise ValueError('Dependency setup failed')
+                  if generated:
+                      (stage / path).write_bytes(payload)
+                      runner = pathlib.Path(os.environ['RUNNER_TEMP']) / 'shipcheck-runner'
+                      runner.mkdir(exist_ok=True)
+                      (runner / 'package.json').write_text(json.dumps(dict(name='shipcheck-isolated-runner', version='1.0.0', private=True, type='module')))
+                      install = subprocess.run(['docker','run','--rm','--user',f'{os.getuid()}:{os.getgid()}',
+                          '--env','HOME=/tmp','--env','npm_config_cache=/tmp/npm-cache','--cap-drop=ALL','--security-opt=no-new-privileges',
+                          '--pids-limit=256','--memory=2g','--cpus=2','-v',f'{runner}:/runner','-w','/runner',
+                          'node:22-bookworm-slim','npm','install','--ignore-scripts','--no-audit','--no-fund','--legacy-peer-deps','vitest@4.1.10'], timeout=120)
+                      if install.returncode != 0:
+                          raise ValueError('Pinned runner setup failed')
+                      config = stage / '.shipcheck-config.mjs'
+                      if config.exists() or config.is_symlink(): config.unlink()
+                      config.write_text("export default { root: '/work', resolve: { alias: { vitest: '/runner/node_modules/vitest/dist/index.js' } }, test: { include: ['shipcheck.generated.test.ts'], environment: 'node', globals: false, testTimeout: 10000, hookTimeout: 10000, maxWorkers: 2 } };")
+                      command = common + ['--network=none','--mount',f'type=bind,src={runner},dst=/runner,readonly',
+                          'node:22-bookworm-slim','/runner/node_modules/vitest/vitest.mjs','run',str(path),'--config','/work/.shipcheck-config.mjs',
+                          '--reporter=json','--outputFile=.shipcheck-vitest.json']
+                  else:
+                      command = common + ['--network=none', 'node:22-bookworm-slim', 'node_modules/.bin/vitest', 'run', str(path),
+                                          '--reporter=json', '--outputFile=.shipcheck-vitest.json', '--maxWorkers=2']
+                  if report['testName']:
+                      command += ['--testNamePattern', report['testName']]
+                  completed = subprocess.run(command, timeout=180)
+                  raw = json.loads((stage / '.shipcheck-vitest.json').read_text())
+                  if any(s.get('name') != '/work/' + str(path) for s in raw.get('testResults', [])):
+                      raise ValueError('The report included a different test file')
+                  assertions = [a for suite in raw.get('testResults', []) for a in suite.get('assertionResults', [])]
+                  # Only passed/failed assertions count. An empty or skipped run,
+                  # a suite/setup error, or an unexpected process exit is inconclusive.
+                  passed = sum(a.get('status') == 'passed' for a in assertions)
+                  failed = sum(a.get('status') == 'failed' for a in assertions)
+                  suite_errors = any(s.get('status') == 'failed' and not any(a.get('status') == 'failed' for a in s.get('assertionResults', [])) for s in raw.get('testResults', []))
+                  if passed + failed == 0 or suite_errors or completed.returncode not in (0, 1) or (completed.returncode != 0 and failed == 0):
+                      raise ValueError('No valid scenario assertions completed')
+                  if generated and any(a.get('status') == 'failed' and not any('AssertionError' in m or 'expected' in m for m in a.get('failureMessages', [])) for a in assertions):
+                      raise ValueError('Generated scenario failed outside an inspectable assertion')
+                  failures = [dict(name=a.get('fullName', a.get('title', 'Scenario'))[:500],
+                                   message='\n'.join(a.get('failureMessages', []))[:2000])
+                              for a in assertions if a.get('status') == 'failed'][:3]
+                  if failed and any(not f['message'] for f in failures):
+                      raise ValueError('Failed assertions did not include inspectable failure evidence')
+                  report.update(testsRun=passed + failed, testsFailed=failed, outcome='failed' if failed else 'passed', failures=failures)
+          except Exception as error:
+              report['errorMessage'] = str(error)[:500]
+              print(f'Scenario inconclusive: {error}')
+          finally:
+              subprocess.run(['docker', 'rm', '-f', container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+              (output / 'runtime-result.json').write_text(json.dumps(report))
+      - name: Attach scenario evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          node-version: "22"
-
-      - name: Install Node dependencies
-        if: |
-          inputs.framework == 'vitest' ||
-          inputs.framework == 'jest' ||
-          inputs.framework == 'node-test' ||
-          inputs.framework == 'playwright'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -f "pnpm-lock.yaml" ]]; then
-            corepack enable
-            pnpm install --frozen-lockfile
-
-          elif [[ -f "yarn.lock" ]]; then
-            corepack enable
-            yarn install --immutable || yarn install --frozen-lockfile
-
-          elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
-            curl -fsSL https://bun.sh/install | bash
-            export PATH="$HOME/.bun/bin:$PATH"
-            bun install --frozen-lockfile
-
-          elif [[ -f "package-lock.json" ]]; then
-            npm ci
-
-          elif [[ -f "package.json" ]]; then
-            npm install
-
-          else
-            echo "No supported Node package manifest was found."
-            exit 1
-          fi
-
-      - name: Install Playwright browser
-        if: inputs.framework == 'playwright'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -f "pnpm-lock.yaml" ]]; then
-            pnpm exec playwright install --with-deps chromium
-          elif [[ -f "yarn.lock" ]]; then
-            yarn playwright install --with-deps chromium
-          else
-            npx --no-install playwright install --with-deps chromium
-          fi
-
-      #
-      # Python
-      #
-
-      - name: Set up Python
-        if: |
-          inputs.framework == 'pytest' ||
-          inputs.framework == 'unittest'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python dependencies
-        if: |
-          inputs.framework == 'pytest' ||
-          inputs.framework == 'unittest'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python -m pip install --upgrade pip
-
-          if [[ -f "requirements.txt" ]]; then
-            python -m pip install -r requirements.txt
-          fi
-
-          if [[ -f "pyproject.toml" ]]; then
-            python -m pip install .
-          elif [[ -f "setup.py" || -f "setup.cfg" ]]; then
-            python -m pip install .
-          fi
-
-          if [[ "$FRAMEWORK" == "pytest" ]]; then
-            python -m pip install pytest
-          fi
-
-      #
-      # Go
-      #
-
-      - name: Set up Go
-        if: inputs.framework == 'go-test'
-        uses: actions/setup-go@v5
-        with:
-          go-version: "stable"
-
-      - name: Download Go dependencies
-        if: inputs.framework == 'go-test'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f "go.mod" ]]; then
-            echo "go.mod was not found."
-            exit 1
-          fi
-
-          go mod download
-
-      #
-      # Rust
-      #
-
-      - name: Set up Rust
-        if: inputs.framework == 'cargo-test'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Fetch Cargo dependencies
-        if: inputs.framework == 'cargo-test'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f "Cargo.toml" ]]; then
-            echo "Cargo.toml was not found."
-            exit 1
-          fi
-
-          cargo fetch --locked || cargo fetch
-
-      #
-      # Java / Kotlin
-      #
-
-      - name: Set up Java
-        if: inputs.framework == 'junit'
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      #
-      # .NET
-      #
-
-      - name: Set up .NET
-        if: inputs.framework == 'dotnet-test'
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.0.x"
-
-      - name: Restore .NET dependencies
-        if: inputs.framework == 'dotnet-test'
-        shell: bash
-        run: |
-          set -euo pipefail
-          dotnet restore
-
-      #
-      # Ruby
-      #
-
-      - name: Set up Ruby
-        if: inputs.framework == 'rspec'
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-          bundler-cache: true
-
-      #
-      # PHP
-      #
-
-      - name: Set up PHP
-        if: inputs.framework == 'phpunit'
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: "8.3"
-          tools: composer
-
-      - name: Install PHP dependencies
-        if: inputs.framework == 'phpunit'
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ ! -f "composer.json" ]]; then
-            echo "composer.json was not found."
-            exit 1
-          fi
-
-          composer install \
-            --no-interaction \
-            --prefer-dist
-
-      #
-      # Execute exactly the approved verification strategy.
-      #
-      # No user-provided shell command is ever executed.
-      #
-
-      - name: Run approved regression test
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          case "$FRAMEWORK" in
-
-            #
-            # JavaScript / TypeScript
-            #
-
-            vitest)
-              if [[ -f "pnpm-lock.yaml" ]]; then
-                pnpm exec vitest run "$TEST_PATH"
-              elif [[ -f "yarn.lock" ]]; then
-                yarn vitest run "$TEST_PATH"
-              elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
-                "$HOME/.bun/bin/bun" x vitest run "$TEST_PATH"
-              else
-                npx --no-install vitest run "$TEST_PATH"
-              fi
-              ;;
-
-            jest)
-              if [[ -f "pnpm-lock.yaml" ]]; then
-                pnpm exec jest "$TEST_PATH" --runInBand
-              elif [[ -f "yarn.lock" ]]; then
-                yarn jest "$TEST_PATH" --runInBand
-              elif [[ -f "bun.lockb" || -f "bun.lock" ]]; then
-                "$HOME/.bun/bin/bun" x jest "$TEST_PATH" --runInBand
-              else
-                npx --no-install jest "$TEST_PATH" --runInBand
-              fi
-              ;;
-
-            node-test)
-              node --test "$TEST_PATH"
-              ;;
-
-            playwright)
-              if [[ -f "pnpm-lock.yaml" ]]; then
-                pnpm exec playwright test "$TEST_PATH"
-              elif [[ -f "yarn.lock" ]]; then
-                yarn playwright test "$TEST_PATH"
-              else
-                npx --no-install playwright test "$TEST_PATH"
-              fi
-              ;;
-
-            #
-            # Python
-            #
-
-            pytest)
-              if [[ -n "$TEST_NAME" ]]; then
-                python -m pytest \
-                  "$TEST_PATH" \
-                  -k "$TEST_NAME"
-              else
-                python -m pytest \
-                  "$TEST_PATH"
-              fi
-              ;;
-
-            unittest)
-              python -m unittest \
-                "$TEST_PATH"
-              ;;
-
-            #
-            # Go
-            #
-
-            go-test)
-              TEST_DIR="$(dirname "$TEST_PATH")"
-
-              if [[ "$TEST_DIR" == "." ]]; then
-                PACKAGE="./"
-              else
-                PACKAGE="./$TEST_DIR"
-              fi
-
-              if [[ -n "$TEST_NAME" ]]; then
-                go test \
-                  "$PACKAGE" \
-                  -run "^${TEST_NAME}$"
-              else
-                go test \
-                  "$PACKAGE"
-              fi
-              ;;
-
-            #
-            # Rust
-            #
-
-            cargo-test)
-              if [[ -n "$TEST_NAME" ]]; then
-                cargo test \
-                  "$TEST_NAME" \
-                  --locked
-              else
-                cargo test \
-                  --locked
-              fi
-              ;;
-
-            #
-            # Java / Kotlin
-            #
-
-            junit)
-              CLASS_NAME="$(
-                basename "$TEST_PATH"
-              )"
-
-              CLASS_NAME="${CLASS_NAME%.*}"
-
-              if [[ -x "./mvnw" ]]; then
-                ./mvnw \
-                  -Dtest="$CLASS_NAME" \
-                  test
-
-              elif [[ -f "pom.xml" ]]; then
-                mvn \
-                  -Dtest="$CLASS_NAME" \
-                  test
-
-              elif [[ -x "./gradlew" ]]; then
-                ./gradlew \
-                  test \
-                  --tests "*.$CLASS_NAME"
-
-              elif [[ -f "build.gradle" || -f "build.gradle.kts" ]]; then
-                gradle \
-                  test \
-                  --tests "*.$CLASS_NAME"
-
-              else
-                echo "No supported Maven or Gradle project was found."
-                exit 1
-              fi
-              ;;
-
-            #
-            # C# / .NET
-            #
-
-            dotnet-test)
-              if [[ -n "$TEST_NAME" ]]; then
-                dotnet test \
-                  --no-restore \
-                  --filter \
-                  "FullyQualifiedName~$TEST_NAME"
-              else
-                CLASS_NAME="$(
-                  basename "$TEST_PATH"
-                )"
-
-                CLASS_NAME="${CLASS_NAME%.*}"
-
-                dotnet test \
-                  --no-restore \
-                  --filter \
-                  "FullyQualifiedName~$CLASS_NAME"
-              fi
-              ;;
-
-            #
-            # Ruby
-            #
-
-            rspec)
-              bundle exec rspec \
-                "$TEST_PATH"
-              ;;
-
-            #
-            # PHP
-            #
-
-            phpunit)
-              if [[ -x "vendor/bin/phpunit" ]]; then
-                if [[ -n "$TEST_NAME" ]]; then
-                  vendor/bin/phpunit \
-                    "$TEST_PATH" \
-                    --filter "$TEST_NAME"
-                else
-                  vendor/bin/phpunit \
-                    "$TEST_PATH"
-                fi
-              else
-                echo "vendor/bin/phpunit was not found."
-                exit 1
-              fi
-              ;;
-
-            *)
-              echo "Unsupported ShipCheck runtime framework: $FRAMEWORK"
-              exit 1
-              ;;
-          esac
+          name: shipcheck-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/shipcheck-report/runtime-result.json
+          retention-days: 30
+          if-no-files-found: error
